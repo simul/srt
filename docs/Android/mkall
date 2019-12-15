@@ -1,6 +1,6 @@
 #!/bin/bash
 
-NDK=/opt/android-ndk-r19
+NDK=/mnt/c/Users/roder/AppData/Local/Android/Sdk/android-ndk-r20
 
 openssl_ver=1.0.2q
 srt_version=1.3.1
