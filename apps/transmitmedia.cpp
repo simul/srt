@@ -1005,6 +1005,7 @@ protected:
 
             if (attr.count("source"))
             {
+#ifdef IP_ADD_SOURCE_MEMBERSHIP
                 /* this is an ssm.  we need to use the right struct and opt */
                 opt_name = IP_ADD_SOURCE_MEMBERSHIP;
                 mreq_ssm.imr_multiaddr.s_addr = sadr.sin_addr.s_addr;
@@ -1012,6 +1013,9 @@ protected:
                 inet_pton(AF_INET, attr.at("source").c_str(), &mreq_ssm.imr_sourceaddr);
                 mreq_arg_size = sizeof(mreq_ssm);
                 mreq_arg_ptr = &mreq_ssm;
+#else
+                throw std::runtime_error("UdpCommon: source-filter multicast not supported by OS");
+#endif
             }
             else
             {
@@ -1050,8 +1054,9 @@ protected:
 
             if ( res == status_error )
             {
-                throw runtime_error("adding to multicast membership failed");
+                Error(errno, "adding to multicast membership failed");
             }
+
             attr.erase("multicast");
             attr.erase("adapter");
         }
@@ -1161,6 +1166,18 @@ public:
     UdpTarget(string host, int port, const map<string,string>& attr )
     {
         Setup(host, port, attr);
+        if (adapter != "")
+        {
+            sockaddr_in maddr = CreateAddrInet(adapter, 0);
+            in_addr addr = maddr.sin_addr;
+
+            int res = setsockopt(m_sock, IPPROTO_IP, IP_MULTICAST_IF, reinterpret_cast<const char*>(&addr), sizeof(addr));
+            if (res == -1)
+            {
+                Error(SysError(), "setsockopt/IP_MULTICAST_IF: " + adapter);
+            }
+        }
+
     }
 
     int Write(const char* data, size_t len, ostream &SRT_ATR_UNUSED = cout) override
