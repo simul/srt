@@ -7,8 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  * 
  */
-#ifndef INC__PLATFORM_SYS_H
-#define INC__PLATFORM_SYS_H
+#ifndef INC_SRT_PLATFORM_SYS_H
+#define INC_SRT_PLATFORM_SYS_H
 
 // INFORMATION
 //
@@ -66,6 +66,15 @@
 
 #endif
 
+#ifdef BSD
+#ifdef SRT_IMPORT_EVENT
+   #include <sys/types.h>
+   #include <sys/event.h>
+   #include <sys/time.h>
+   #include <unistd.h>
+#endif
+#endif
+
 #ifdef LINUX
 
 #ifdef SRT_IMPORT_EVENT
@@ -92,6 +101,15 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+
+#ifdef __cplusplus
+// Headers for errno, string and stdlib are
+// included indirectly correct C++ way.
+#else
+#include <errno.h>
+#include <string.h>
+#include <stdlib.h>
+#endif
 
 #endif
 
