@@ -152,7 +152,8 @@ void CUDT::construct()
     m_bBroken             = false;
     m_bPeerHealth         = true;
     m_RejectReason        = SRT_REJ_UNKNOWN;
-    m_tsLastReqTime         = steady_clock::time_point();
+    m_tsLastReqTime       = steady_clock::time_point();
+    m_SrtHsSide           = HSD_DRAW;
 
     m_lSrtVersion            = SRT_DEF_VERSION;
     m_lPeerSrtVersion        = 0; // not defined until connected.
@@ -7187,7 +7188,7 @@ int64_t CUDT::recvfile(fstream &ofs, int64_t &offset, int64_t size, int block)
         throw CUDTException(MJ_NOTSUP, MN_INVALBUFFERAPI, 0);
     }
 
-    ScopedLock recvguard(m_RecvLock);
+    UniqueLock recvguard(m_RecvLock);
 
     // Well, actually as this works over a FILE (fstream), not just a stream,
     // the size can be measured anyway and predicted if setting the offset might
@@ -7247,8 +7248,7 @@ int64_t CUDT::recvfile(fstream &ofs, int64_t &offset, int64_t size, int block)
         }
 
         {
-            UniqueLock gl   (m_RecvDataLock);
-            CSync rcond (m_RecvDataCond,  gl);
+            CSync rcond (m_RecvDataCond, recvguard);
 
             THREAD_PAUSED();
             while (stillConnected() && !m_pRcvBuffer->isRcvDataReady())
@@ -7597,7 +7597,6 @@ void CUDT::initSynch()
 {
     setupMutex(m_SendBlockLock, "SendBlock");
     setupCond(m_SendBlockCond, "SendBlock");
-    setupMutex(m_RecvDataLock, "RecvData");
     setupCond(m_RecvDataCond, "RecvData");
     setupMutex(m_SendLock, "Send");
     setupMutex(m_RecvLock, "Recv");
@@ -7613,7 +7612,6 @@ void CUDT::destroySynch()
 {
     releaseMutex(m_SendBlockLock);
     releaseCond(m_SendBlockCond);
-    releaseMutex(m_RecvDataLock);
     releaseCond(m_RecvDataCond);
     releaseMutex(m_SendLock);
     releaseMutex(m_RecvLock);
@@ -7627,22 +7625,29 @@ void CUDT::destroySynch()
 
 void CUDT::releaseSynch()
 {
+    SRT_ASSERT(m_bClosing);
     // wake up user calls
     CSync::lock_signal(m_SendBlockCond, m_SendBlockLock);
 
     enterCS(m_SendLock);
     leaveCS(m_SendLock);
 
-    CSync::lock_signal(m_RecvDataCond, m_RecvDataLock);
+    // Awake tsbpd() and srt_recv*(..) threads for them to check m_bClosing.
+    CSync::lock_signal(m_RecvDataCond, m_RecvLock);
     CSync::lock_signal(m_RcvTsbPdCond, m_RecvLock);
 
-    enterCS(m_RecvDataLock);
+    // Azquiring m_RcvTsbPdStartupLock protects race in starting
+    // the tsbpd() thread in CUDT::processData().
+    // Wait for tsbpd() thread to finish.
+    enterCS(m_RcvTsbPdStartupLock);
     if (m_RcvTsbPdThread.joinable())
     {
         m_RcvTsbPdThread.join();
     }
-    leaveCS(m_RecvDataLock);
+    leaveCS(m_RcvTsbPdStartupLock);
 
+    // Acquiring the m_RecvLock it is assumed that both tsbpd()
+    // and srt_recv*(..) threads will be aware about the state of m_bClosing.
     enterCS(m_RecvLock);
     leaveCS(m_RecvLock);
 }
@@ -7801,6 +7806,7 @@ void CUDT::sendCtrl(UDTMessageType pkttype, const int32_t* lparam, void* rparam,
                 /* Newly acknowledged data, signal TsbPD thread */
                 UniqueLock rcvlock (m_RecvLock);
                 CSync tscond   (m_RcvTsbPdCond, rcvlock);
+                // m_bTsbPdAckWakeup is protected by m_RecvLock in the tsbpd() thread
                 if (m_bTsbPdAckWakeup)
                     tscond.signal_locked(rcvlock);
             }
@@ -7809,7 +7815,7 @@ void CUDT::sendCtrl(UDTMessageType pkttype, const int32_t* lparam, void* rparam,
                 if (m_bSynRecving)
                 {
                     // signal a waiting "recv" call if there is any data available
-                    CSync::lock_signal(m_RecvDataCond, m_RecvDataLock);
+                    CSync::lock_signal(m_RecvDataCond, m_RecvLock);
                 }
                 // acknowledge any waiting epolls to read
                 s_UDTUnited.m_EPoll.update_events(m_SocketID, m_sPollID, SRT_EPOLL_IN, true);
@@ -9341,8 +9347,6 @@ int CUDT::processData(CUnit* in_unit)
 
     CPacket &packet = in_unit->m_Packet;
 
-    // XXX This should be called (exclusively) here:
-    // m_pRcvBuffer->addLocalTsbPdDriftSample(packet.getMsgTimeStamp());
     // Just heard from the peer, reset the expiration count.
     m_iEXPCount = 1;
     m_tsLastRspTime = steady_clock::now();
@@ -9352,6 +9356,11 @@ int CUDT::processData(CUnit* in_unit)
     // We are receiving data, start tsbpd thread if TsbPd is enabled
     if (need_tsbpd && !m_RcvTsbPdThread.joinable())
     {
+        ScopedLock lock(m_RcvTsbPdStartupLock);
+
+        if (m_bClosing) // Check again to protect join() in CUDT::releaseSync()
+            return -1;
+
         HLOGP(qrlog.Debug, "Spawning Socket TSBPD thread");
 #if ENABLE_HEAVY_LOGGING
         std::ostringstream tns1, tns2;
@@ -9368,8 +9377,6 @@ int CUDT::processData(CUnit* in_unit)
         if (!StartThread(m_RcvTsbPdThread, CUDT::tsbpd, this, thname))
             return -1;
     }
-    // NOTE: In case of group TSBPD, this facility will be started
-    // in different place. Group TSBPD is a concept implementation - not done here.
 
     const int pktrexmitflag = m_bPeerRexmitFlag ? (packet.getRexmitFlag() ? 1 : 0) : 2;
 #if ENABLE_HEAVY_LOGGING
